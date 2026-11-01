@@ -117,6 +117,12 @@ The filename in the request was `L1_fast_agent_state.poy`. The existing file use
 This note records the current code and documentation. The experiment's live results were not supplied.
 
 - `L1_fast_agent_state.py` uses LangGraph to select one source for a music question.
+- Node `prepare_question` accepts either Graph input with `question` or Chat input with `messages`.
+- `QuestionInput` exposes only those two optional fields. Internal state fields stay out of the input form.
+- `question_message_id` and `question_message_text` record the last consumed Chat user message.
+- The text marker detects edited user messages that keep the same ID.
+- New questions clear earlier clarification state. Clarification resumes skip `prepare_question`.
+- Answer branches omit duplicate user messages from their nested agents.
 - Node `classify_question` classifies the question. Python permits only `answer_from_markdown`, `answer_from_sql`, or `clarify`.
 - `classify_question` builds its partial `Command.update` with `State(...)`.
 - Node `answer_from_markdown` invokes a shared Deep Agent that reads the two Markdown files through file tools.
@@ -136,6 +142,14 @@ This note records the current code and documentation. The experiment's live resu
 - Two unsuccessful clarification replies end the request. Typing `quit` also ends the request.
 - Setup creates one shared model, Markdown agent, SQL agent, and checkpointer. Node functions reuse those objects.
 - `InMemorySaver` stores graph state only while the Python process runs.
+- Root `langgraph.json` exposes `music_question` through `build_studio_graph`.
+- Run `uv run langgraph dev --config langgraph.json` from the `python` directory to open Studio.
+- The Studio entry point binds the local database and leaves checkpointing to LangGraph.
+- Database and model setup run in worker threads to keep the server's event loop free.
+- LangGraph invokes the Studio factory for each graph load. Dependencies are shared within each returned graph.
+- Graph input is `{"question": "..."}`. Chat input uses `messages`. No database object is needed in the request context.
+- `build_graph(db=...)` binds a database and removes the Python-only context schema.
+- Without a bound database, direct Python runs still supply `RuntimeContext(db=...)`.
 - The script uses `# %%` cells. Run the cells in order.
 - `llm.py` supplies the shared OpenRouter model setup.
 - When tracing is enabled, `run_question` registers `LangChainTracer` in the invocation callbacks.
@@ -172,3 +186,14 @@ Tracing checks use a local recorder to confirm run IDs, thread metadata, and nes
 The dependency lock check and whitespace check passed.
 The compiled Mermaid text contains the meaningful node names.
 Live model calls, LangSmith uploads, and PNG rendering were not run during this update.
+
+Studio configuration validation: all 37 offline tests passed.
+The local LangGraph server started and served its health, assistant list, and graph schemas.
+The startup check used a placeholder model key and submitted no model requests.
+
+Studio Chat fix: the original graph required `question`, but Chat supplied only `messages`.
+That mismatch caused `KeyError: 'question'` before the first model call.
+All 43 offline tests passed after the fix, including same-ID message edits.
+Two requests through the local LangGraph API used Chat message input in the same server thread.
+The SQL and Markdown branches passed with a simulated model and real source tools.
+The browser UI and live model calls were not checked for this fix.

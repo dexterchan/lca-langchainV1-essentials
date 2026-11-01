@@ -1,5 +1,6 @@
 """Check source selection, clarification, and shared agents without live models."""
 
+import asyncio
 import json
 import tempfile
 import unittest
@@ -112,7 +113,7 @@ class MusicWorkflowTests(unittest.TestCase):
             config=self.config, context=self.context, stream_mode="updates",
         ))
 
-        self.assertEqual([next(iter(item)) for item in updates], ["classify_question", "answer_from_markdown"])
+        self.assertEqual([next(iter(item)) for item in updates], ["prepare_question", "classify_question", "answer_from_markdown"])
         self.assertEqual(updates[-1]["answer_from_markdown"]["report"], "Try Evening Lines for its soft piano.")
         self.assertEqual(llm.request_tools[0], [])
         self.assertIn("read_file", llm.request_tools[1])
@@ -135,10 +136,154 @@ class MusicWorkflowTests(unittest.TestCase):
             config=self.config, context=self.context, stream_mode="updates",
         ))
 
-        self.assertEqual([next(iter(item)) for item in updates], ["classify_question", "answer_from_sql"])
+        self.assertEqual([next(iter(item)) for item in updates], ["prepare_question", "classify_question", "answer_from_sql"])
         self.assertEqual(updates[-1]["answer_from_sql"]["report"], "The artist is Artist 1.")
         self.assertEqual(llm.request_tools, [[], ["execute_sql"], ["execute_sql"]])
         self.assertIn("Artist 1", llm.requests[-1][-1].content)
+
+    def test_studio_entry_point_answers_sql_without_database_in_request_context(self):
+        llm = OfflineModel(replies=[
+            route("answer_from_sql"), sql_request("SELECT Name FROM Artist"),
+            AIMessage(content="The artist is Artist 1."),
+        ])
+        with (
+            patch.object(lesson, "create_workflow_model", return_value=llm),
+            patch.object(lesson.SQLDatabase, "from_uri", return_value=self.db) as connect,
+        ):
+            graph = asyncio.run(lesson.build_studio_graph())
+
+        connect.assert_called_once_with(f"sqlite:///{lesson.STUDIO_DIR / 'music_catalog.db'}")
+        self.assertFalse(graph.checkpointer)
+        self.assertIsNone(graph.get_context_jsonschema())
+        graph.get_input_jsonschema()
+        graph.get_output_jsonschema()
+        result = graph.invoke(
+            {"question": "What is the exact artist name?"}, context={},
+        )
+        self.assertEqual(result["report"], "The artist is Artist 1.")
+        self.assertIn("Artist 1", llm.requests[-1][-1].content)
+
+    def test_studio_clarification_uses_the_server_checkpointer(self):
+        llm = OfflineModel(replies=[
+            route("clarify", "Which source should I use?"),
+            route("answer_from_sql"), sql_request("SELECT Name FROM Artist"),
+            AIMessage(content="The artist is Artist 1."),
+        ])
+        with (
+            patch.object(lesson, "create_workflow_model", return_value=llm),
+            patch.object(lesson.SQLDatabase, "from_uri", return_value=self.db),
+        ):
+            graph = asyncio.run(lesson.build_studio_graph())
+        # LangGraph API supplies persistence to the exported graph.
+        graph = graph.copy(update={"checkpointer": lesson.InMemorySaver()})
+        paused = graph.invoke({"question": "Tell me about music."}, config=self.config)
+        self.assertTrue(paused["__interrupt__"])
+        resumed = graph.invoke(Command(resume="Only exact artist names."), config=self.config)
+        self.assertEqual(resumed["report"], "The artist is Artist 1.")
+
+    def test_studio_chat_accepts_messages_without_a_question_field(self):
+        question = "Recommend an album for a quiet evening."
+        llm = OfflineModel(replies=[
+            route("answer_from_markdown"), read_sources(),
+            AIMessage(content="Try Evening Lines."),
+        ])
+        result = lesson.build_graph(llm, markdown_root=self.directory).invoke(
+            {"messages": [{"role": "user", "content": question}]},
+            config=self.config, context=self.context,
+        )
+        self.assertEqual(result["question"], question)
+        self.assertEqual(llm.requests[0][-1].content, question)
+        self.assertEqual(result["report"], "Try Evening Lines.")
+        self.assertEqual(
+            [message.text for message in result["messages"] if message.type == "human"],
+            [question],
+        )
+
+    def test_new_chat_turn_clears_previous_clarifications(self):
+        llm = OfflineModel(replies=[
+            route("clarify"), route("answer_from_sql"),
+            sql_request("SELECT Name FROM Artist"), AIMessage(content="Artist 1."),
+            route("answer_from_markdown"), read_sources(), AIMessage(content="Try Evening Lines."),
+        ])
+        graph = lesson.build_graph(llm, markdown_root=self.directory)
+        first_question = "Recommend music and list exact artist names."
+        first = graph.invoke(
+            {"messages": [{"role": "user", "content": first_question}]},
+            config=self.config, context=self.context,
+        )
+        self.assertTrue(first["__interrupt__"])
+        resumed = graph.invoke(
+            Command(resume="Only exact artist names."),
+            config=self.config, context=self.context,
+        )
+        self.assertEqual(resumed["question"], first_question)
+        self.assertIn("Only exact artist names.", llm.requests[1][-1].content)
+        second_question = "Recommend an album for a quiet evening."
+        second = graph.invoke(
+            {"messages": [{"role": "user", "content": second_question}]},
+            config=self.config, context=self.context,
+        )
+        self.assertEqual(second["question"], second_question)
+        self.assertEqual(second["clarifications"], [])
+        self.assertEqual(second["clarification_rounds"], 0)
+        self.assertEqual(llm.requests[4][-1].content, second_question)
+        self.assertEqual(second["report"], "Try Evening Lines.")
+
+    def test_graph_question_after_chat_uses_new_explicit_question(self):
+        llm = OfflineModel(replies=[
+            route("answer_from_sql"), sql_request("SELECT Name FROM Artist"),
+            AIMessage(content="Artist 1."),
+            route("answer_from_markdown"), read_sources(), AIMessage(content="Try Evening Lines."),
+        ])
+        graph = lesson.build_graph(llm, markdown_root=self.directory)
+        graph.invoke(
+            {"messages": [{"role": "user", "content": "List exact artist names."}]},
+            config=self.config, context=self.context,
+        )
+        question = "Recommend an album for a quiet evening."
+        result = graph.invoke(
+            {"question": question}, config=self.config, context=self.context,
+        )
+        self.assertEqual(result["question"], question)
+        self.assertEqual(llm.requests[3][-1].content, question)
+
+    def test_edited_chat_message_with_the_same_id_uses_the_new_text(self):
+        llm = OfflineModel(replies=[
+            route("answer_from_markdown"), read_sources(), AIMessage(content="Try Evening Lines."),
+            route("answer_from_sql"), sql_request("SELECT Name FROM Artist"),
+            AIMessage(content="Artist 1."),
+        ])
+        graph = lesson.build_graph(llm, markdown_root=self.directory)
+        for question in ["Recommend quiet music.", "List exact artist names."]:
+            result = graph.invoke(
+                {"messages": [{"role": "user", "content": question, "id": "user-question"}]},
+                config=self.config, context=self.context,
+            )
+        self.assertEqual(result["question"], "List exact artist names.")
+        self.assertEqual(llm.requests[3][-1].content, "List exact artist names.")
+        self.assertEqual(
+            [message.text for message in result["messages"] if message.type == "human"],
+            ["List exact artist names."],
+        )
+
+    def test_studio_input_schema_exposes_only_user_input_fields(self):
+        graph = lesson.build_graph(OfflineModel(replies=[]), markdown_root=self.directory)
+        schema = graph.get_input_jsonschema()
+        self.assertEqual(set(schema["properties"]), {"question", "messages"})
+        self.assertEqual(schema.get("required", []), [])
+
+    def test_missing_or_blank_question_has_clear_error_without_model_calls(self):
+        for graph_input in [
+            {}, {"question": " "},
+            {"messages": [{"role": "user", "content": " "}]},
+            {"messages": [{"role": "assistant", "content": "An earlier answer."}]},
+        ]:
+            with self.subTest(graph_input=graph_input):
+                llm = OfflineModel(replies=[])
+                graph = lesson.build_graph(llm, markdown_root=self.directory)
+                with self.assertRaisesRegex(ValueError, "question.*user message"):
+                    graph.invoke(graph_input, config=self.config, context=self.context)
+                self.assertEqual(llm.requests, [])
 
     def test_sql_agent_discovers_schema_through_its_tool(self):
         llm = OfflineModel(replies=[

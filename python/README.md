@@ -130,6 +130,9 @@ To run the music graph with Markdown, SQL, and user clarification:
 uv run python L1_fast_agent_state.py
 ```
 
+Node `prepare_question` accepts a question field or the latest new Chat user message.
+Each new question clears earlier clarification replies and counters.
+Clarification resumes keep the original question and skip this preparation step.
 Node `classify_question` makes one model call to classify a natural question.
 Python validates the result and returns `Command(update=..., goto=...)`.
 The accepted destinations are `answer_from_markdown`, `answer_from_sql`, and `clarify`.
@@ -138,7 +141,8 @@ The model's classification can vary. Python controls the permitted transitions a
 
 ```mermaid
 flowchart TD
-    START --> classify_question["Classify question"]
+    START --> prepare_question["Prepare question from Graph or Chat"]
+    prepare_question --> classify_question["Classify question"]
     classify_question -->|History or recommendation| answer_from_markdown["Deep Agent: Markdown files"]
     classify_question -->|Exact catalog facts| answer_from_sql["Answer from SQL"]
     classify_question -->|Mixed or unclear| clarify["Ask the user"]
@@ -285,7 +289,32 @@ source .venv/bin/activate  # On Windows: .venv\Scripts\activate
 jupyter lab
 ```
 
-Optional: Setup [LangSmith Studio](https://docs.langchain.com/oss/python/langchain/studio)
+Optional: Debug the music graph in [LangSmith Studio](https://docs.langchain.com/oss/python/langchain/studio).
+
+Run from the `python` directory. The root `langgraph.json` exposes the graph as `music_question`.
+The entry point binds `studio/music_catalog.db` and uses `studio` for Markdown file tools.
+LangGraph manages saved state and clarification pauses. No database object is needed in the request context.
+Supply `OPENROUTER_API_KEY` and your LangSmith settings through the environment or `python/.env`.
+
+```bash
+uv run langgraph dev --config langgraph.json
+```
+
+Select `music_question` in Studio.
+In the Chat tab, type a question directly.
+In the Graph tab, enter this input:
+
+```json
+{"question": "What is the price and artist of Evening Lines?"}
+```
+
+For a history question, try `{"question": "Recommend an album for a quiet evening."}`.
+Chat sends `messages`; `prepare_question` copies the new user message into `question`.
+If both inputs are supplied, the new user message takes priority.
+The input form shows only `question` and `messages`. The graph creates its internal state fields.
+Answer clarification prompts in the same Studio thread.
+
+The older SQL agent remains available through `studio/langgraph.json`:
 
 ```bash
 # copy the .env file you created above to the studio directory

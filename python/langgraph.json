@@ -1,0 +1,7 @@
+{
+  "dependencies": ["."],
+  "graphs": {
+    "music_question": "./L1_fast_agent_state.py:build_studio_graph"
+  },
+  "env": ".env"
+}

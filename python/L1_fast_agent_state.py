@@ -7,19 +7,20 @@ From the python directory, run: uv run python L1_fast_agent_state.py
 # %% [markdown]
 # # Lesson 1: A state graph with a shared SQL agent
 #
-# START -> classify_question -> answer_from_markdown -> END
-# START -> classify_question -> answer_from_sql -> END
+# START -> prepare_question -> classify_question -> answer_from_markdown -> END
+# START -> prepare_question -> classify_question -> answer_from_sql -> END
 # classify_question -> clarify -> classify_question  (pause, reply, classify again)
 # clarify -> END  (quit or remain unclear after two replies)
 
 # %%
+import asyncio
 import json
 import sqlite3
 import sys
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal, TypedDict
 from uuid import UUID, uuid4
 
 LESSON_DIR = Path(__file__).resolve().parent if "__file__" in globals() else Path.cwd()
@@ -38,12 +39,13 @@ from langchain.agents.middleware import (
     ToolCallLimitMiddleware,
     wrap_tool_call,
 )
-from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import AnyMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import tool
 from langchain_core.tracers.langchain import LangChainTracer
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, MessagesState, StateGraph
+from langgraph.graph.message import add_messages
 from langgraph.runtime import Runtime, get_runtime
 from langgraph.types import Command, interrupt
 from langsmith.utils import tracing_is_enabled
@@ -78,8 +80,15 @@ class RuntimeContext:
     db: SQLDatabase | None = None
 
 
+class QuestionInput(TypedDict, total=False):
+    question: str
+    messages: Annotated[list[AnyMessage], add_messages]
+
+
 class State(MessagesState):
     question: str
+    question_message_id: str | None
+    question_message_text: str | None
     task: str
     route: Literal["answer_from_markdown", "answer_from_sql", "clarify"]
     report: str
@@ -91,6 +100,32 @@ class State(MessagesState):
 class RouteDecision(BaseModel):
     route: Literal["answer_from_markdown", "answer_from_sql", "clarify"]
     question: str = DEFAULT_CLARIFICATION
+
+
+def prepare_question(state: State) -> State:
+    """Accept a Graph question or a new Chat user message and reset turn state."""
+    latest_user_message = next(
+        (message for message in reversed(state.get("messages", []))
+         if isinstance(message, HumanMessage)),
+        None,
+    )
+    question = state.get("question", "")
+    question_message_id = state.get("question_message_id")
+    question_message_text = state.get("question_message_text")
+    if latest_user_message is not None and (
+        latest_user_message.id != question_message_id
+        or latest_user_message.text != question_message_text
+    ):
+        question = latest_user_message.text
+        question_message_id = latest_user_message.id
+        question_message_text = latest_user_message.text
+    if not isinstance(question, str) or not question.strip():
+        raise ValueError("Supply a non-empty question or a user message in messages.")
+    return State(
+        question=question.strip(), question_message_id=question_message_id,
+        question_message_text=question_message_text,
+        task="", report="", clarifications=[], clarification_prompt="", clarification_rounds=0,
+    )
 
 
 # %% [markdown]
@@ -251,7 +286,11 @@ def answer_from_markdown(state: State, *, markdown_agent):
         {"messages": [HumanMessage(content=state["task"])]},
         config={"recursion_limit": 60},
     )
-    return State(messages=result["messages"], report=result["messages"][-1].text)
+    # Keep the original Chat user message without adding the nested agent's copy.
+    return State(
+        messages=[message for message in result["messages"] if not isinstance(message, HumanMessage)],
+        report=result["messages"][-1].text,
+    )
 
 
 # %% [markdown]
@@ -275,13 +314,19 @@ def create_sql_agent(model):
     )
 
 
-def answer_from_sql(state: State, runtime: Runtime[RuntimeContext], *, sql_agent):
+def answer_from_sql(
+    state: State, runtime: Runtime[RuntimeContext], *, sql_agent, db: SQLDatabase | None = None,
+):
     """Invoke the shared SQL agent and return its answer."""
+    context = RuntimeContext(db=db) if db is not None else runtime.context
     result = sql_agent.invoke(
         {"messages": [HumanMessage(content=state["task"])]},
-        context=runtime.context, config={"recursion_limit": 40},
+        context=context, config={"recursion_limit": 40},
     )
-    return {"messages": result["messages"], "report": result["messages"][-1].text}
+    return State(
+        messages=[message for message in result["messages"] if not isinstance(message, HumanMessage)],
+        report=result["messages"][-1].text,
+    )
 
 
 # %% [markdown]
@@ -323,13 +368,21 @@ def node_clarify(state: State) -> Command[Literal["classify_question", END]]:
 # partial supplies shared objects without adding nested node functions.
 
 # %%
-def build_graph(model=None, *, markdown_root: Path = STUDIO_DIR, checkpointer=None):
-    """Create shared dependencies once and wire source selection and clarification."""
+def build_graph(
+    model=None, *, markdown_root: Path = STUDIO_DIR, checkpointer=None,
+    db: SQLDatabase | None = None,
+):
+    """Wire the graph with a bound database or a database supplied through context."""
     model = model if model is not None else create_workflow_model()
     markdown_agent = create_markdown_agent(model, markdown_root=markdown_root)
     sql_agent = create_sql_agent(model)
     checkpointer = checkpointer if checkpointer is not None else InMemorySaver()
-    builder = StateGraph(State, context_schema=RuntimeContext)
+    # A bound database keeps SQLDatabase objects out of Studio's JSON context schema.
+    builder = StateGraph(
+        State, input_schema=QuestionInput,
+        context_schema=RuntimeContext if db is None else None,
+    )
+    builder.add_node("prepare_question", prepare_question)
     builder.add_node(
         "classify_question", partial(classify_question, model=model),
         destinations=("answer_from_markdown", "answer_from_sql", "clarify"),
@@ -337,12 +390,21 @@ def build_graph(model=None, *, markdown_root: Path = STUDIO_DIR, checkpointer=No
     builder.add_node(
         "answer_from_markdown", partial(answer_from_markdown, markdown_agent=markdown_agent),
     )
-    builder.add_node("answer_from_sql", partial(answer_from_sql, sql_agent=sql_agent))
+    builder.add_node("answer_from_sql", partial(answer_from_sql, sql_agent=sql_agent, db=db))
     builder.add_node("clarify", node_clarify)
-    builder.add_edge(START, "classify_question")
+    builder.add_edge(START, "prepare_question")
+    builder.add_edge("prepare_question", "classify_question")
     builder.add_edge("answer_from_markdown", END)
     builder.add_edge("answer_from_sql", END)
     return builder.compile(checkpointer=checkpointer)
+
+
+async def build_studio_graph():
+    """Export the music graph with local sources and server-managed persistence."""
+    db = await asyncio.to_thread(
+        SQLDatabase.from_uri, f"sqlite:///{STUDIO_DIR / 'music_catalog.db'}",
+    )
+    return await asyncio.to_thread(build_graph, db=db, checkpointer=False)
 
 
 # %% [markdown]
