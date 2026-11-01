@@ -130,25 +130,25 @@ To run the music graph with Markdown, SQL, and user clarification:
 uv run python L1_fast_agent_state.py
 ```
 
-Node `a` makes one model call to classify a natural question.
+Node `classify_question` makes one model call to classify a natural question.
 Python validates the result and returns `Command(update=..., goto=...)`.
-The accepted destinations are `b`, `c`, and `clarify`.
+The accepted destinations are `answer_from_markdown`, `answer_from_sql`, and `clarify`.
 Invalid model output also selects clarification.
 The model's classification can vary. Python controls the permitted transitions and call limits.
 
 ```mermaid
 flowchart TD
-    START --> a["a: classify the question"]
-    a -->|History or recommendation| b["b: Markdown response"]
-    a -->|Exact catalog facts| c["c: shared SQL agent"]
-    a -->|Mixed or unclear| clarify["Ask the user"]
-    clarify -->|User replies| a
+    START --> classify_question["Classify question"]
+    classify_question -->|History or recommendation| answer_from_markdown["Deep Agent: Markdown files"]
+    classify_question -->|Exact catalog facts| answer_from_sql["Answer from SQL"]
+    classify_question -->|Mixed or unclear| clarify["Ask the user"]
+    clarify -->|User replies| classify_question
     clarify -->|Quit or two unsuccessful rounds| END
-    b --> END
-    c --> END
+    answer_from_markdown --> END
+    answer_from_sql --> END
 ```
 
-Both `b` and `c` exist in the same graph. A question selects one source.
+Both answer branches exist in the same graph. A question selects one source.
 All node functions are outside `build_graph`.
 
 The fictional sources are in `studio`:
@@ -158,30 +158,61 @@ The fictional sources are in `studio`:
 - [music_catalog.db](studio/music_catalog.db) contains matching artists, genres, albums, and tracks.
 - [music_catalog.sql](studio/music_catalog.sql) is the readable seed for that database.
 
-“Recommend an album for a quiet evening” should select `b`.
-“Why did Mira Vale make Evening Lines?” should also select `b`.
-Node `b` reads the two Markdown files and makes one model call without tools.
+“Recommend an album for a quiet evening” should select `answer_from_markdown`.
+“Why did Mira Vale make Evening Lines?” should also select `answer_from_markdown`.
+Node `answer_from_markdown` invokes a shared Deep Agent.
+The agent reads both Markdown files through its `read_file` tool.
 Its instructions require answers from the Markdown only.
 If the history lacks the answer, it should say it is not able to answer.
-The source folder comes from `RuntimeContext.markdown_root`, which defaults to `studio`.
 
-“What is the price and artist of Evening Lines?” should select `c`.
-The top-level `node_c` invokes the shared SQL agent with the question and runtime context.
+`build_graph(markdown_root=...)` sets the folder for the agent's file tools. The default is `studio`.
+This replaces the earlier `RuntimeContext.markdown_root` setting.
+For example, create a graph for a separate folder that contains the two Markdown files:
+
+```python
+from pathlib import Path
+
+graph = build_graph(markdown_root=Path("music_notes"))
+```
+
+The backend uses `FilesystemBackend(root_dir=markdown_root, virtual_mode=True)`.
+Paths such as `/lesson_notes.md` refer to files inside that folder.
+The agent can list, read, search, write, and edit files in that folder.
+Its instructions permit writes and edits only when the user requests them.
+Path traversal and symlinks that escape the folder are blocked.
+Shell execution and subagent calls are disabled for this branch.
+These file tools enforce path limits. The backend does not provide process isolation.
+Each Markdown run permits four model calls and six tool executions.
+The classifier call has a separate budget.
+Automatic summaries and file offloading are disabled.
+This keeps model calls within the budget and prevents automatic history files in the source folder.
+
+“What is the price and artist of Evening Lines?” should select `answer_from_sql`.
+The top-level `answer_from_sql` invokes the shared SQL agent with the question and runtime context.
 The agent discovers schema and queries data through one read-only tool.
-Each SQL run allows three agent model calls and two tool executions.
+Each SQL run allows six agent model calls and four tool executions.
 The classifier call has a separate budget.
 
 A question requiring both sources selects `clarify`.
 That node uses `interrupt()` to pause for a reply.
 Resume with `Command(resume=reply)` using the same thread ID and runtime context.
-The reply returns the graph to `a`, with the original question and clarification history.
+The reply returns the graph to `classify_question`, with the original question and clarification history.
 The latest reply can narrow the request to one source.
 After two replies, a request that remains unclear goes to `END`.
 Blank replies count toward that limit.
 Typing `quit` ends the request immediately.
 
 ```python
-config = {"configurable": {"thread_id": "music-question-1"}}
+from uuid import uuid4
+
+from langchain_core.tracers.langchain import LangChainTracer
+from langsmith.utils import tracing_is_enabled
+
+config = {
+    "run_id": uuid4(),
+    "configurable": {"thread_id": "music-question-1"},
+    "callbacks": [LangChainTracer()] if tracing_is_enabled() else [],
+}
 result = graph.invoke(
     {"question": "Recommend an album and list exact track durations."},
     config=config,
@@ -189,6 +220,7 @@ result = graph.invoke(
 )
 if result.get("__interrupt__"):
     print(result["__interrupt__"][0].value["question"])
+    config = {**config, "run_id": uuid4()}
     result = graph.invoke(
         Command(resume="Only recommend a calm album."),
         config=config,
@@ -196,7 +228,7 @@ if result.get("__interrupt__"):
     )
 ```
 
-`build_graph` creates one shared model, one SQL agent, and one checkpointer.
+`build_graph` creates one shared model, one Markdown Deep Agent, one SQL agent, and one checkpointer.
 The `@tool` definition creates the SQL tool once when the module loads.
 Nodes reuse these objects across requests and clarification replies.
 The example cells also create the database object once.
@@ -204,7 +236,25 @@ Use a new thread ID for each new question.
 The in-memory checkpointer keeps paused state only while the Python process runs.
 All model calls use the shared setup in `llm.py` and need `OPENROUTER_API_KEY`.
 
-To check both graphs with real SQLite queries and simulated model replies:
+Set `LANGSMITH_TRACING=true` and supply `LANGSMITH_API_KEY` to export traces.
+`LANGSMITH_PROJECT` selects the project. These settings can come from the environment or `python/.env`.
+`run_question` registers `LangChainTracer` in the invocation callbacks when tracing is enabled.
+Nested agents, models, and tools inherit that tracer.
+
+Each `invoke` gets a unique run ID, which `run_question` prints.
+You can supply the first run ID:
+
+```python
+run_id = uuid4()
+result = run_question(graph, "Recommend calm music.", context, run_id=run_id)
+```
+
+Clarification resumes get new run IDs because each resume is a separate invocation.
+The thread ID stays the same.
+The `thread_id` and `question_run_id` metadata connect the traces for the question.
+Local runs still work when tracing is disabled.
+
+To check both graphs with real file operations, SQLite queries, and simulated model replies:
 
 ```bash
 uv run python -m unittest discover -s tests -v
