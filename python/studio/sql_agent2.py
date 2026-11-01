@@ -1,16 +1,21 @@
 """SQL agent for studio."""
 
-import pathlib
-import re
+import sys
+from pathlib import Path
 
-import requests
 from langchain.agents import create_agent
-from langchain.chat_models import init_chat_model
-from sql_db import SQLDatabase
-from langchain_core.messages import SystemMessage
 from langchain_core.tools import tool
 
-llm = init_chat_model("openai:gpt-5")
+from sql_db import SQLDatabase
+
+# Load the common model setup from the parent Python directory.
+LESSON_DIR = Path(__file__).resolve().parents[1]
+if str(LESSON_DIR) not in sys.path:
+    sys.path.append(str(LESSON_DIR))
+
+from llm import create_model  # noqa: E402 - Requires the parent directory on sys.path.
+
+llm = create_model()
 
 # database is from:
 # url = "https://storage.googleapis.com/benchmarks-artifacts/chinook/Chinook.db"
